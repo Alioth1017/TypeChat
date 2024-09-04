@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from types import NoneType, UnionType
+from collections import OrderedDict
 import inspect
+import typing
 import typing_extensions
 from dataclasses import MISSING, Field, dataclass
 from types import NoneType, UnionType
@@ -20,8 +21,7 @@ from typing_extensions import (
     Protocol,
     Required,
     TypeAlias,
-    TypeAliasType,
-    TypedDict,
+    TypeAliasType,    
     TypeGuard,
     TypeVar,
     Union,
@@ -48,6 +48,7 @@ from typechat._internal.ts_conversion.ts_type_nodes import (
     StringTypeReferenceNode,
     ThisTypeReferenceNode,
     TopLevelDeclarationNode,
+    TupleTypeNode,
     TypeAliasDeclarationNode,
     TypeNode,
     TypeParameterDeclarationNode,
@@ -55,10 +56,14 @@ from typechat._internal.ts_conversion.ts_type_nodes import (
     UnionTypeNode,
 )
 
+class GenericDeclarationish(Protocol):
+    __parameters__: list[TypeVar]
+    __type_params__: list[TypeVar] # NOTE: may not be present unless running in 3.12
 
 class GenericAliasish(Protocol):
     __origin__: object
     __args__: tuple[object, ...]
+    __name__: str
 
 
 class Annotatedish(Protocol):
@@ -99,7 +104,16 @@ _KNOWN_GENERIC_SPECIAL_FORMS: frozenset[Any] = frozenset(
     ]
 )
 
-_KNOWN_SPECIAL_BASES: frozenset[Any] = frozenset([TypedDict, Protocol])
+_KNOWN_SPECIAL_BASES: frozenset[Any] = frozenset([
+    typing.TypedDict,
+    typing_extensions.TypedDict,
+    Protocol,
+
+    # In older versions of Python, `__orig_bases__` will not be defined on `TypedDict`s
+    # derived from the built-in `typing` module (but they will from `typing_extensions`!).
+    # So `get_original_bases` will fetch `__bases__` which will map `TypedDict` to a plain `dict`.
+    dict,
+])
 
 
 @dataclass
@@ -132,8 +146,9 @@ _LIST_TYPES: set[object] = {
 def python_type_to_typescript_nodes(root_py_type: object) -> TypeScriptNodeTranslationResult:
     # TODO: handle conflicting names
 
-    declared_types: dict[object, TopLevelDeclarationNode | None] = {}
-    undeclared_types = {root_py_type}
+    declared_types: OrderedDict[object, TopLevelDeclarationNode | None] = OrderedDict()
+    undeclared_types: OrderedDict[object, object] = OrderedDict({root_py_type: root_py_type}) # just a set, really
+    used_names: dict[str, type | TypeAliasType] = {}
     errors: list[str] = []
 
     def skip_annotations(py_type: object) -> object:
@@ -155,7 +170,7 @@ def python_type_to_typescript_nodes(root_py_type: object) -> TypeScriptNodeTrans
 
         if py_type_to_declare not in declared_types:
             if is_python_type_or_alias(py_type_to_declare):
-                undeclared_types.add(py_type_to_declare)
+                undeclared_types[py_type_to_declare] = py_type_to_declare
             elif not isinstance(py_type, TypeVar):
                 errors.append(f"Invalid usage of '{py_type}' as a type annotation.")
                 return AnyTypeReferenceNode
@@ -222,7 +237,29 @@ def python_type_to_typescript_nodes(root_py_type: object) -> TypeScriptNodeTrans
                     key_type_arg = StringTypeReferenceNode
                 return TypeReferenceNode(IdentifierNode("Record"), [key_type_arg, value_type_arg])
 
-            # TODO: tuple
+            if origin is tuple:
+                # Note that when the type is `tuple[()]`,
+                # `type_args` will be an empty tuple.
+                # Which is nice, because we don't have to special-case anything!
+                type_args = get_args(py_type)
+
+                if Ellipsis in type_args:
+                    if len(type_args) != 2:
+                        errors.append(
+                            f"The tuple type '{py_type}' is ill-formed. Tuples with an ellipsis can only take the form 'tuple[SomeType, ...]'."
+                        )
+                        return ArrayTypeNode(AnyTypeReferenceNode)
+
+                    ellipsis_index = type_args.index(Ellipsis)
+                    if ellipsis_index != 1:
+                        errors.append(
+                            f"The tuple type '{py_type}' is ill-formed because the ellipsis (...) cannot be the first element."
+                        )
+                        return ArrayTypeNode(AnyTypeReferenceNode)
+
+                    return ArrayTypeNode(convert_to_type_node(type_args[0]))
+
+                return TupleTypeNode([convert_to_type_node(py_type_arg) for py_type_arg in type_args])
 
             if origin is Union or origin is UnionType:
                 type_node = [convert_to_type_node(py_type_arg) for py_type_arg in get_args(py_type)]
@@ -284,27 +321,42 @@ def python_type_to_typescript_nodes(root_py_type: object) -> TypeScriptNodeTrans
 
         if optional is None:
             optional = optionality_default
-        
+
         type_annotation = convert_to_type_node(skip_annotations(current_annotation))
         return PropertyDeclarationNode(name, optional, comment or "", type_annotation)
+
+    def reserve_name(val: type | TypeAliasType):
+        type_name = val.__name__
+        if type_name in used_names:
+            errors.append(f"Cannot create a schema using two types with the same name. {type_name} conflicts between {val} and {used_names[type_name]}")
+        else:
+            used_names[type_name] = val
 
     def declare_type(py_type: object):
         if (is_typeddict(py_type) or is_dataclass(py_type)) and isinstance(py_type, type):
             comment = py_type.__doc__ or ""
 
-            if hasattr(py_type, "__type_params__"):
-                type_params = [TypeParameterDeclarationNode(type_param.__name__) for type_param in py_type.__type_params__] # type: ignore
+            if hasattr(py_type, "__type_params__") and cast(GenericDeclarationish, py_type).__type_params__:
+                type_params = [
+                    TypeParameterDeclarationNode(type_param.__name__)
+                    for type_param in cast(GenericDeclarationish, py_type).__type_params__
+                ]
+            elif hasattr(py_type, "__parameters__") and cast(GenericDeclarationish, py_type).__parameters__:
+                type_params = [
+                    TypeParameterDeclarationNode(type_param.__name__)
+                    for type_param in cast(GenericDeclarationish, py_type).__parameters__
+                ]
             else:
                 type_params = None
 
             annotated_members = get_type_hints(py_type, include_extras=True)
-            
+
             raw_but_filtered_bases: list[type] = [
                 base
                 for base in get_original_bases(py_type)
                 if not(base is object or base in _KNOWN_SPECIAL_BASES or get_origin(base) in _KNOWN_GENERIC_SPECIAL_FORMS)
             ]
-            base_attributes: dict[str, set[object]] = {}
+            base_attributes: OrderedDict[str, set[object]] = OrderedDict()
             for base in raw_but_filtered_bases:
                 for prop, type_hint in get_type_hints(get_origin(base) or base, include_extras=True).items():
                     base_attributes.setdefault(prop, set()).add(type_hint)
@@ -333,12 +385,18 @@ def python_type_to_typescript_nodes(root_py_type: object) -> TypeScriptNodeTrans
                     prop = declare_property(attr_name, type_hint, is_typeddict_attribute=False, optionality_default=optional)
                     properties.append(prop)
 
+            reserve_name(py_type)
             return InterfaceDeclarationNode(py_type.__name__, type_params, comment, bases, properties)
         if isinstance(py_type, type):
-            errors.append("Currently only TypedDict, dataclass, and type alias declarations are supported in TypeChat.")
-            return InterfaceDeclarationNode(py_type.__name__, None, f"Comment for {py_type.__name__}.", None, [])
+            errors.append(f"{py_type.__name__} was not a TypedDict, dataclass, or type alias, and cannot be translated.")
+
+            reserve_name(py_type)
+
+            return InterfaceDeclarationNode(py_type.__name__, None, "", None, [])
         if isinstance(py_type, TypeAliasType):
             type_params = [TypeParameterDeclarationNode(type_param.__name__) for type_param in py_type.__type_params__]
+
+            reserve_name(py_type)
 
             return TypeAliasDeclarationNode(
                 py_type.__name__,
@@ -370,7 +428,7 @@ def python_type_to_typescript_nodes(root_py_type: object) -> TypeScriptNodeTrans
         return result
 
     while undeclared_types:
-        py_type = undeclared_types.pop()
+        py_type = undeclared_types.popitem()[0]
         declared_types[py_type] = None
         declared_types[py_type] = declare_type(py_type)
 

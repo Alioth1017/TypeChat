@@ -1,7 +1,7 @@
 from __future__ import annotations
 import asyncio
-import json
-from typing import TypedDict, no_type_check
+from collections.abc import Sequence
+from typing import Any, TypeAlias, TypedDict, cast
 from typing_extensions import (
     TypeVar,
     Callable,
@@ -9,53 +9,24 @@ from typing_extensions import (
     Annotated,
     NotRequired,
     override,
-    Sequence,
     Doc,
-    Any,
 )
 
 from typechat import (
     Failure,
-    Result,
     Success,
-    TypeChatModel,
+    TypeChatLanguageModel,
     TypeChatValidator,
-    TypeChatTranslator,
+    TypeChatJsonTranslator,
     python_type_to_typescript_schema,
 )
-import collections.abc
 
 T = TypeVar("T", covariant=True)
 
 
-program_schema_text = '''
-// A program consists of a sequence of function calls that are evaluated in order.
-export type Program = {
-    "@steps": FunctionCall[];
-}
+Expression: TypeAlias = "str | int | float | bool | None | dict[str, Expression] | list[Expression] | FunctionCall | ResultReference"
 
-// A function call specifies a function name and a list of argument expressions. Arguments may contain
-// nested function calls and result references.
-export type FunctionCall = {
-    // Name of the function
-    "@func": string;
-    // Arguments for the function, if any
-    "@args"?: Expression[];
-};
-
-// An expression is a JSON value, a function call, or a reference to the result of a preceding expression.
-export type Expression = JsonValue | FunctionCall | ResultReference;
-
-// A JSON value is a string, a number, a boolean, null, an object, or an array. Function calls and result
-// references can be nested in objects and arrays.
-export type JsonValue = string | number | boolean | null | { [x: string]: Expression } | Expression[];
-
-// A result reference represents the value of an expression from a preceding step.
-export type ResultReference = {
-    // Index of the previous expression in the "@steps" array
-    "@ref": number;
-};
-'''
+JsonProgram = TypedDict("JsonProgram", {"@steps": list["FunctionCall"]})
 
 
 ResultReference = TypedDict(
@@ -66,50 +37,61 @@ FunctionCall = TypedDict(
     "FunctionCall",
     {
         "@func": Annotated[str, Doc("Name of the function")],
-        "@args": NotRequired[Annotated[list["Expression"], Doc("Arguments for the function, if any")]],
+        "@args": NotRequired[Annotated[list[Expression], Doc("Arguments for the function, if any")]],
     },
 )
 
-JsonValue = str | int | float | bool | None | dict[str, "Expression"] | list["Expression"]
-Expression = JsonValue | FunctionCall | ResultReference # type: ignore
+translation_result = python_type_to_typescript_schema(JsonProgram)
+program_schema_text = translation_result.typescript_schema_str
 
-JsonProgram = TypedDict("JsonProgram", {"@steps": list[FunctionCall]})
 
-@no_type_check
+JsonValue = str | int | float | bool | None | dict[str, "JsonValue"] | list["JsonValue"]
+
 async def evaluate_json_program(
-    program: JsonProgram, onCall: Callable[[str, Sequence[Expression]], Awaitable[Expression]]
-) -> Expression | Sequence[Expression]:
-    results: list[Expression] | Expression = []
+    program: JsonProgram,
+    onCall: Callable[[str, Sequence[JsonValue]], Awaitable[JsonValue]]
+) -> JsonValue:
+    results: list[JsonValue] = []
 
-    @no_type_check
-    async def evaluate_array(array: Sequence[Expression]) -> Sequence[Expression]:
-        return await asyncio.gather(*[evaluate_call(e) for e in array])
+    def evaluate_array(array: Sequence[JsonValue]) -> Awaitable[list[JsonValue]]:
+        return asyncio.gather(*[evaluate_expression(e) for e in array])
 
-    @no_type_check
-    async def evaluate_object(expr: FunctionCall):
-        if "@ref" in expr:
-            index = expr["@ref"]
-            if index < len(results):
-                return results[index]
+    async def evaluate_expression(expr: JsonValue) -> JsonValue:
+        match expr:
+            case bool() | int() | float() | str() | None:
+                return expr
 
-        elif "@func" in expr and "@args" in expr:
-            function_name = expr["@func"]
-            return await onCall(function_name, await evaluate_array(expr["@args"]))
+            case { "@ref": int(index) } if not isinstance(index, bool):
+                if 0 <= index < len(results):
+                    return results[index]
+                
+                raise ValueError(f"Index {index} is out of range [0, {len(results)})")
 
-        elif isinstance(expr, collections.abc.Sequence):
-            return await evaluate_array(expr)
+            case { "@ref": ref_value }:
+                raise ValueError(f"'ref' value must be an integer, but was ${ref_value}")
 
-        else:
-            raise ValueError("This condition should never hit")
+            case { "@func": str(function_name) }:
+                args: list[JsonValue]
+                match expr:
+                    case { "@args": None }:
+                        args = []
+                    case { "@args": list() }:
+                        args = cast(list[JsonValue], expr["@args"]) # TODO
+                    case { "@args": _ }:
+                        raise ValueError("Given an invalid value for '@args'.")
+                    case _:
+                        args = []
 
-    @no_type_check
-    async def evaluate_call(expr: FunctionCall) -> Expression | Sequence[Expression]:
-        if isinstance(expr, int) or isinstance(expr, float) or isinstance(expr, str):
-            return expr
-        return await evaluate_object(expr)
+                return await onCall(function_name, await evaluate_array(args))
+            
+            case list(array_expression_elements):
+                return await evaluate_array(array_expression_elements)    
+
+            case _:
+                raise ValueError("This condition should never hit")
 
     for step in program["@steps"]:
-        results.append(await evaluate_call(step))
+        results.append(await evaluate_expression(cast(JsonValue, step)))
 
     if len(results) > 0:
         return results[-1]
@@ -117,28 +99,30 @@ async def evaluate_json_program(
         return None
 
 
-class TypeChatProgramValidator(TypeChatValidator[T]):
-    def __init__(self, py_type: type[T]):
-        # the base class init method creates a typeAdapter for T. This operation fails for the JsonProgram type
-        super().__init__(py_type=Any)  # type: ignore
+class TypeChatProgramValidator(TypeChatValidator[JsonProgram]):
+    def __init__(self):
+        # TODO: This example should eventually be updated to use Python 3.12 type aliases
+        # Passing in `JsonProgram` for `py_type` would cause issues because
+        # Pydantic's `TypeAdapter` ends up trying to eagerly construct an
+        # anonymous recursive type. Even a NewType does not work here.
+        # For now, we just pass in `Any` in place of `JsonProgram`.
+        super().__init__(py_type=cast(type[JsonProgram], Any))
 
     @override
-    def validate(self, json_text: str) -> Result[T]:
-        # Pydantic is not able to validate JsonProgram instances. It fails with a recursion error.
-        # For JsonProgram, simply validate that it has a non-zero number of @steps
-        # TODO: extend validations
-        typed_dict = json.loads(json_text)
-        if "@steps" in typed_dict and isinstance(typed_dict["@steps"], collections.abc.Sequence):
-            return Success(typed_dict)
+    def validate_object(self, obj: Any) -> Success[JsonProgram] | Failure:
+        if "@steps" in obj and isinstance(obj["@steps"], Sequence):
+            return Success(obj)
         else:
             return Failure("This is not a valid program. The program must have an array of @steps")
+        
 
 
-class TypeChatProgramTranslator(TypeChatTranslator[T]):
+class TypeChatProgramTranslator(TypeChatJsonTranslator[JsonProgram]):
     _api_declaration_str: str
 
-    def __init__(self, model: TypeChatModel, validator: TypeChatProgramValidator[T], api_type: type):
-        super().__init__(model=model, validator=validator, target_type=api_type)
+    def __init__(self, model: TypeChatLanguageModel, validator: TypeChatProgramValidator, api_type: type):
+        super().__init__(model=model, validator=validator, target_type=api_type, _raise_on_schema_errors = False)
+        # TODO: the conversion result here has errors!
         conversion_result = python_type_to_typescript_schema(api_type)
         self._api_declaration_str = conversion_result.typescript_schema_str
 
